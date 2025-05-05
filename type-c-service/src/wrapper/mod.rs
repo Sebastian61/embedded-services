@@ -4,6 +4,8 @@ use core::array::from_fn;
 use core::cell::{Cell, RefCell};
 
 use embassy_futures::select::{select3, select_array, Either3};
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::mutex::Mutex;
 use embedded_services::power::policy::device::StateKind;
 use embedded_services::power::policy::{self, action};
 use embedded_services::type_c::controller::{self, Controller, PortStatus};
@@ -19,6 +21,60 @@ const DEFAULT_SOURCE_CURRENT: TypecCurrent = TypecCurrent::Current1A5;
 /// Threshold power capability before we'll attempt to sink from a dual-role supply
 /// This ensures we don't try to sink from something like a phone
 const DUAL_ROLE_CONSUMER_THRESHOLD_MW: u32 = 15000;
+static DBG_CARD_STS: Mutex<ThreadModeRawMutex, RefCell<RecordDbgCard>> = Mutex::new(RefCell::new(RecordDbgCard::new()));
+
+#[derive(Debug, Clone)]
+pub struct RecordDbgCard {
+    pub debug_card_connect: u8,
+    pub dedicate_port: DebugCardPort,
+    pub initial: bool,
+}
+
+impl RecordDbgCard {
+    const fn new() -> Self {
+        Self {
+            debug_card_connect: 0,
+            dedicate_port: DebugCardPort::GlobalPort0,
+            initial: false,
+        }
+    }
+}
+
+pub async fn set_debug_card_port(select_port: DebugCardPort) {
+    let dbg_temp = DBG_CARD_STS.lock().await;
+    let mut assign_port = dbg_temp.borrow_mut();
+    assign_port.dedicate_port = select_port;
+    assign_port.initial = true;
+}
+
+pub async fn set_debug_card_status(status: u8, port: u8) {
+    let dbg_temp = DBG_CARD_STS.lock().await;
+    let mut assign_status = dbg_temp.borrow_mut();
+
+    if assign_status.initial == true {
+        if assign_status.dedicate_port as u8 == port {
+            assign_status.debug_card_connect = status;
+        } else {
+            error!("Inserting Debug Card in incorrect port!!");
+        }
+    } else {
+        error!("Debug port not assigned yet!!");
+    }
+}
+
+pub async fn get_debug_card_status() -> u8 {
+    let dbg_temp = DBG_CARD_STS.lock().await;
+
+    let report = dbg_temp.borrow().debug_card_connect;
+    report
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DebugCardPort {
+    GlobalPort0,
+    GlobalPort1,
+    GlobalPort2,
+}
 
 /// Takes an implementation of the `Controller` trait and wraps it with logic to handle
 /// message passing and power-policy integration.
@@ -144,6 +200,13 @@ impl<'a, const N: usize, C: Controller> ControllerWrapper<'a, N, C> {
                 }
             };
             trace!("Port{} status: {:#?}", port, status);
+            let mut debug_card_detect: u8;
+            if status.is_connected() && status.is_debug_accessory() {
+                debug_card_detect = 1;
+            } else {
+                debug_card_detect = 0;
+            }
+            set_debug_card_status(debug_card_detect, global_port_id.0).await;
 
             let power = match self.get_power_device(local_port_id) {
                 Ok(power) => power,
